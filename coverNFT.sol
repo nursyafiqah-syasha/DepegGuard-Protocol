@@ -6,6 +6,7 @@ import "@openzeppelin/contracts@5.0.0/token/ERC721/ERC721.sol";
 //import "@openzeppelin/contracts@5.0.0/token/ERC721/extensions/ERC721URIStorage.sol";
 //import "@openzeppelin/contracts@5.0.0/token/ERC721/extensions/ERC721Burnable.sol";
 import "@openzeppelin/contracts@5.0.0/access/Ownable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 // use this website for reference https://docs.openzeppelin.com/contracts/5.x/api/token/erc721
 
 contract DepegInsuranceNFT is ERC721, Ownable {
@@ -23,6 +24,9 @@ contract DepegInsuranceNFT is ERC721, Ownable {
 
     //we want to map the token id which will incrementally added to the the policy data
     mapping(uint256 => PolicyData) public policies;
+
+    //store chainline price feed address for each stablecoin
+    mapping(address => address) public stablecoinPriceFeeds;
 
     //logged events to search using indexed parameter as filter
     event PolicyMinted(uint256 indexed tokenId, address indexed holder, address stablecoin, uint256 amount);
@@ -72,6 +76,41 @@ contract DepegInsuranceNFT is ERC721, Ownable {
         return policies[_tokenId];
     }
 
+    //set oracle address, only owner can call this function
+    function setPriceFeed (address _stablecoin, address _priceFeedAddress) public onlyOwner {
+        stablecoinPriceFeeds[_stablecoin] = _priceFeedAddress;
+    }
+
+    //get price feed interface , interact with other contracts and call functions in another contract
+    function _getPriceFeed(address _stablecoin) internal view returns (AggregatorV3Interface) {
+        address feedAddress = stablecoinPriceFeeds[_stablecoin];
+        require(feedAddress != address(0), "Price feed not set up for this stablecoin");
+        return AggregatorV3Interface(feedAddress);
+    }
+
+    function _getPricePercentage(address _stablecoin) internal view returns (uint256){
+        AggregatorV3Interface priceFeed = _getPriceFeed(_stablecoin);
+
+        //latestRoundData returns : (roundId, answer, startedAt, updatedAt, answeredInRound)
+        //https://docs.chain.link/chainlink-local/api-reference/v022/aggregator-v3-interface
+        (int256 answer)  = priceFeed.latestRoundData();
+
+        // price returrned by chain link is scaled by 10^8
+        //stablecoin is pegged to 1 usd, feed is X/USD (DAI/USD)
+        // if peg is 10^8 a price of 0.95 USD would be 95,000,000
+        //number of decimals the value will have
+        uint256 decimals = priceFeed.decimals();
+
+        uint256 pegValue = 10**decimals;
+
+        require(price >0, "Chainlink price is invalid or zero");
+
+        uint256 PricePercentage = (uint256(price) * 100)/pegValue;
+        return pricePercentage;
+    }
+
+
+
     // owner NFT can file a claim
     function fileClaim (uint256 _tokenId) public {
         //check ownership
@@ -83,14 +122,26 @@ contract DepegInsuranceNFT is ERC721, Ownable {
         require(policy.isActive, "Policy inactive or already claimed");
         require(block.timestamp <= policy.expiryTimestamp, "Policy expired");
 
-        //verify depeg chainlink oracle price
+        //verify depeg chainlink oracle price /depeg detection
 
+        uint256 currentPricePercent = _getSimulatedCurrentPrice(policy.stablecoin);
+        uint256 payoutPercent = _getPayoutPercentage(policy.severity,currentPricePercent);
+
+        require (payoutPercent > 0, "Depeg condition not met for policy severity tier");
+
+        //calculate final payout (coverage amount * payment percentage) /100
+        uint256 payoutAmount = (coverageAmount * payoutPercent)/100;
+
+
+        // ensure contract has sufficient funds
+        require(address(this).balance >= payoutAmount, "Insufficient contract balance for payout");
         //mark as inactive to present double claims
         policy.isActive = false;
 
-        emit PolicyClaimed(_tokenId);
+        //payout
+        payable(msg.sender).transfer(payoutAmount);
 
-        //payout logic
+        emit PolicyClaimed(_tokenId);
     }
 
     //withdraw premiums for insurance provider
